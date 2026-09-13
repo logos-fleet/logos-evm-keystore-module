@@ -44,6 +44,34 @@ hex = "0.4"
 # `storage` references no lp_* symbol, and an rlib contributes only what is reached.
 logos-rust-sdk = { path = "../logos-rust-sdk-src" }
 
+# ── the `web` variant's one dependency correction ──────────────────────────
+#
+# NOT USED BY ANY LINE OF THIS CRATE. It is here to turn a feature ON in a
+# TRANSITIVE dependency, which is the only way cargo offers.
+#
+# `eth_keystore::encrypt_key` calls `Uuid::new_v4()` for the vault's id, and
+# uuid 0.8 compiles `new_v4` out of existence on every wasm32 target that is
+# not wasi unless one of its two browser features is enabled:
+#
+#     #[cfg(all(feature = "v4", any(not(target_arch = "wasm32"), target_os = "wasi",
+#         all(target_arch = "wasm32", any(feature = "stdweb", feature = "wasm-bindgen")))))]
+#     mod v4;
+#
+# wasm32-unknown-emscripten is wasm32 and is not wasi, so without this the
+# `web` variant fails to build -- inside eth-keystore, on a method that exists
+# everywhere else.
+#
+# The feature is misnamed for what it does here: `wasm-bindgen = ["getrandom",
+# "getrandom/js"]` adds no wasm-bindgen dependency, it only flips getrandom's
+# `js` feature, and getrandom declares its js backend only for
+# `target_os = "unknown"`. On emscripten getrandom keeps its own backend
+# (getentropy, which emscripten's libc has). So the effect of this line is
+# exactly "let uuid compile new_v4", and nothing else.
+#
+# Scoped to the target, so the native build's dependency graph is untouched.
+[target.'cfg(target_os = "emscripten")'.dependencies]
+uuid = { version = "0.8", features = ["wasm-bindgen"] }
+
 [features]
 default = ["logos_module"]
 # The generated contract scaffold + module glue. Off for `cargo test
