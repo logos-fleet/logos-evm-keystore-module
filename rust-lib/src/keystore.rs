@@ -267,10 +267,7 @@ impl Keystore {
         let mut out = Vec::new();
         // A store that cannot be opened or listed holds no accounts, which is
         // what an unreadable directory used to answer here.
-        let keys = match self.store() {
-            Ok(store) => store.list().unwrap_or_default(),
-            Err(_) => Vec::new(),
-        };
+        let keys = self.store().ok().and_then(|s| s.list().ok()).unwrap_or_default();
         for name in keys {
             if let Some(stem) = name.strip_suffix(".json") {
                 if let Ok(addr) = format!("0x{stem}").parse::<Address>() {
@@ -292,7 +289,7 @@ impl Keystore {
     pub fn delete_account(&mut self, address: &str, password: &str) -> Result<bool> {
         let addr = parse_address(address)?;
         let path = self.vault_path(&addr)?;
-        if !path.exists() {
+        if !self.store()?.exists(&vault_key(&addr)) {
             return Ok(false);
         }
         // Require the correct password before destroying the vault.
@@ -312,7 +309,7 @@ impl Keystore {
     pub fn unlock(&mut self, address: &str, password: &str, ttl: Option<Duration>) -> Result<()> {
         let addr = parse_address(address)?;
         let path = self.vault_path(&addr)?;
-        if !path.exists() {
+        if !self.store()?.exists(&vault_key(&addr)) {
             return Err(KeystoreError::NotFound(address.to_string()));
         }
         let key = eth_keystore::decrypt_key(&path, password).map_err(|e| KeystoreError::Vault(e.to_string()))?;
