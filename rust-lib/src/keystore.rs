@@ -143,15 +143,12 @@ fn parse_address(s: &str) -> Result<Address> {
     Ok(Address::from_slice(&bytes))
 }
 
-fn vault_name(addr: &Address) -> String {
-    // lowercase hex, no 0x — stable filename + easy listing
-    format!("{:x}", addr)
-}
-
-/// The store key a vault is filed under. Flat, which is what the storage
-/// contract requires and what this module always used anyway.
+/// The store key a vault is filed under: lowercase hex, no `0x`, `.json`.
+/// Flat, which is what the storage contract requires and what this module
+/// always used anyway, and stable enough that `list_accounts` reads an address
+/// back out of it.
 fn vault_key(addr: &Address) -> String {
-    format!("{}.json", vault_name(addr))
+    format!("{addr:x}.json")
 }
 
 impl Keystore {
@@ -268,12 +265,16 @@ impl Keystore {
 
     pub fn list_accounts(&self) -> Vec<Address> {
         let mut out = Vec::new();
-        if let Ok(keys) = self.store().and_then(|s| s.list().map_err(|e| KeystoreError::Io(e.to_string()))) {
-            for name in keys {
-                if let Some(stem) = name.strip_suffix(".json") {
-                    if let Ok(addr) = format!("0x{stem}").parse::<Address>() {
-                        out.push(addr);
-                    }
+        // A store that cannot be opened or listed holds no accounts, which is
+        // what an unreadable directory used to answer here.
+        let keys = match self.store() {
+            Ok(store) => store.list().unwrap_or_default(),
+            Err(_) => Vec::new(),
+        };
+        for name in keys {
+            if let Some(stem) = name.strip_suffix(".json") {
+                if let Ok(addr) = format!("0x{stem}").parse::<Address>() {
+                    out.push(addr);
                 }
             }
         }
@@ -501,7 +502,7 @@ fn tempfile_with(contents: &str) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use logos_rust_sdk::storage::StorageError;
+    use logos_rust_sdk::storage::Result as StorageResult;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use alloy::consensus::transaction::SignerRecoverable;
@@ -553,13 +554,13 @@ mod tests {
     }
 
     impl Storage for CountingStore {
-        fn read(&self, key: &str) -> std::result::Result<Vec<u8>, StorageError> { self.inner.read(key) }
-        fn write(&self, key: &str, bytes: &[u8]) -> std::result::Result<(), StorageError> { self.inner.write(key, bytes) }
-        fn remove(&self, key: &str) -> std::result::Result<bool, StorageError> { self.inner.remove(key) }
+        fn read(&self, key: &str) -> StorageResult<Vec<u8>> { self.inner.read(key) }
+        fn write(&self, key: &str, bytes: &[u8]) -> StorageResult<()> { self.inner.write(key, bytes) }
+        fn remove(&self, key: &str) -> StorageResult<bool> { self.inner.remove(key) }
         fn exists(&self, key: &str) -> bool { self.inner.exists(key) }
-        fn list(&self) -> std::result::Result<Vec<String>, StorageError> { self.inner.list() }
+        fn list(&self) -> StorageResult<Vec<String>> { self.inner.list() }
         fn local_dir(&self) -> Option<&Path> { self.inner.local_dir() }
-        fn commit(&self) -> std::result::Result<(), StorageError> {
+        fn commit(&self) -> StorageResult<()> {
             self.commits.fetch_add(1, Ordering::Relaxed);
             self.inner.commit()
         }
