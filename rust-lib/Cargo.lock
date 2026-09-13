@@ -1862,14 +1862,17 @@ name = "keystore_module"
 version = "1.0.0"
 dependencies = [
  "alloy",
+ "coins-bip32",
  "eth-keystore",
  "hex",
  "logos-rust-sdk",
  "rand 0.8.6",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "thiserror 2.0.18",
+ "zeroize",
 ]
 
 [[package]]
