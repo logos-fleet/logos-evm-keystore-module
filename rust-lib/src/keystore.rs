@@ -547,7 +547,7 @@ impl Keystore {
         // Require the correct password, and that the vault really holds THIS account, before
         // destroying it: deleting A must never destroy B's only key.
         self.signer_for(address, password)?;
-        std::fs::remove_file(&path).map_err(|e| KeystoreError::Io(e.to_string()))?;
+        atomic::remove_published(&path).map_err(|e| KeystoreError::Io(e.to_string()))?;
         self.retire(&addr)?;
         Ok(true)
     }
@@ -1132,18 +1132,25 @@ fn remove_path(path: &Path) -> Result<bool> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(e) => return Err(KeystoreError::Io(e.to_string())),
     };
-    let removed = if meta.is_dir() {
+    if meta.is_dir() {
         // A directory nobody may read cannot be recursed into, so the acknowledged removal
         // failed on the exact state it exists to clear. We own it: reopen it and retry once,
         // so a reported path stays actionable rather than being a report and a dead end.
-        std::fs::remove_dir_all(path).or_else(|e| match atomic::set_mode(path, 0o700) {
-            Ok(()) => std::fs::remove_dir_all(path),
-            Err(_) => Err(e),
-        })
+        std::fs::remove_dir_all(path)
+            .or_else(|e| match atomic::set_mode(path, 0o700) {
+                Ok(()) => std::fs::remove_dir_all(path),
+                Err(_) => Err(e),
+            })
+            .map_err(|e| KeystoreError::Io(e.to_string()))?;
+        // The directory was published state too, so its removal takes the same barrier a
+        // file removal takes -- see atomic::remove_published.
+        if let Some(parent) = path.parent() {
+            let _ = logos_rust_sdk::storage::commit(parent);
+        }
+        Ok(true)
     } else {
-        std::fs::remove_file(path)
-    };
-    removed.map(|()| true).map_err(|e| KeystoreError::Io(e.to_string()))
+        atomic::remove_published(path).map_err(|e| KeystoreError::Io(e.to_string()))
+    }
 }
 
 fn now_ms() -> u64 {

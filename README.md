@@ -117,6 +117,26 @@ See [`docs/specs.md`](docs/specs.md) for the full reference, including the BIP-3
 BIP-44 derivation contract and what an `extkey` derivation group does and does not
 reach.
 
+## Persistence
+
+Every vault, document and removal this module publishes goes through one function —
+`atomic::barrier` — and that function is `logos_rust_sdk::storage::commit`.
+
+Natively it is the directory fsync it always was. It is the SDK's barrier now because the
+same sources build a **`web` variant**, and there it is not a formality: an emscripten
+image has a filesystem, so every write here *succeeds* in a webview, reads back correctly
+for the life of the page, and is gone on the next load unless something pushes it into the
+browser's IndexedDB. That push is what the barrier does on emscripten.
+
+The keystore keeps its own on-disk layout (`layout.rs`), its own atomic-write shapes
+(`atomic.rs`) and its own unix modes — it does not become a key/value store. It takes the
+barrier and nothing else, which is why the native behaviour is unchanged line for line.
+`atomic.rs`'s `every_published_write_and_removal_reaches_the_barrier` is the guard: a new
+write path that publishes without it fails there rather than on a phone.
+
+`logos-rust-sdk` is therefore a plain (non-optional) dependency; `--no-default-features`
+still drops the module glue and the lp_* link symbols, and now compiles the barrier too.
+
 ## Build & test
 
 ```bash
