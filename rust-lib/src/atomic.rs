@@ -43,15 +43,61 @@ pub fn tighten_dir(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// Best-effort. A failed directory fsync cannot make a rename non-atomic — only
-/// non-durable across a power cut, which this module does not promise.
-fn sync_dir(dir: &Path) {
-    #[cfg(unix)]
-    {
-        let _ = std::fs::File::open(dir).and_then(|f| f.sync_all());
+/// THE DURABILITY BARRIER, and the one call site every publishing write here ends at.
+///
+/// It used to be an inline `#[cfg(unix)]` directory fsync, and natively that is still
+/// exactly what it does. It is `logos_rust_sdk::storage::commit` now because the same
+/// sources build a `web` variant, and there the barrier is not a formality: an emscripten
+/// image has a filesystem, so every write in this module SUCCEEDS in a webview, reads back
+/// correctly for the life of the page, and is gone on the next load unless something pushes
+/// it into the browser's IndexedDB. That push is what the SDK's barrier is on emscripten.
+///
+/// One function, and every writer routed through it, so a new write path cannot be correct
+/// natively and lossy on a phone — see the test at the bottom of this file.
+///
+/// Best-effort, unchanged: a failed barrier cannot make a rename non-atomic, only
+/// non-durable across a power cut (or, on the web, across a page load), which this module
+/// does not promise.
+fn barrier(dir: &Path) {
+    #[cfg(test)]
+    BARRIERS.with(|n| n.set(n.get() + 1));
+    let _ = logos_rust_sdk::storage::commit(dir);
+}
+
+// How many times `barrier` has been reached ON THIS THREAD. Tests only: the barrier has
+// no observable effect on a native filesystem, and the property worth guarding is that
+// every writer goes through it.
+//
+// Per-thread rather than global because the test harness runs the suite in parallel and a
+// shared counter would make every other writing test this one's flake.
+#[cfg(test)]
+thread_local! {
+    static BARRIERS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn barrier_count() -> usize {
+    BARRIERS.with(|n| n.get())
+}
+
+/// Remove a published path and commit the removal.
+///
+/// A delete is a write. On a native filesystem the unlink is already durable enough for
+/// what this module promises, so the barrier reads as ceremony; in a Wasm host a vault
+/// deleted without one is BACK after the next page load, which is the same class of bug as
+/// a lost write and worse in consequence. `Ok(false)` when there was nothing there — and
+/// then nothing was written, so nothing is committed.
+pub fn remove_published(path: &Path) -> io::Result<bool> {
+    match std::fs::remove_file(path) {
+        Ok(()) => {
+            if let Some(parent) = path.parent() {
+                barrier(parent);
+            }
+            Ok(true)
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
     }
-    #[cfg(not(unix))]
-    let _ = dir;
 }
 
 /// A staging directory for a write we do not perform ourselves.
@@ -109,7 +155,7 @@ impl Stage {
         std::fs::OpenOptions::new().write(true).open(&staged)?.sync_all()?;
         std::fs::rename(&staged, dest)?;
         if let Some(parent) = dest.parent() {
-            sync_dir(parent);
+            barrier(parent);
         }
         Ok(())
     }
@@ -125,7 +171,7 @@ pub fn write_doc(root: &Path, dest: &Path, bytes: &[u8]) -> io::Result<()> {
     // The rename is only atomic with respect to a crash if the bytes are down first.
     f.as_file().sync_all()?;
     f.persist(dest).map_err(|e| e.error)?;
-    sync_dir(root);
+    barrier(root);
     Ok(())
 }
 
@@ -221,6 +267,40 @@ mod tests {
             .filter(|n| n != "doc.json")
             .collect();
         assert!(left.is_empty(), "left staged: {left:?}");
+    }
+
+    /// EVERY PUBLISHING OPERATION REACHES THE BARRIER.
+    ///
+    /// Natively the barrier is the directory fsync this module always did, and a missing
+    /// one costs durability across a power cut. In the `web` variant it is what pushes the
+    /// image's filesystem into the browser's IndexedDB, and a missing one costs the vault:
+    /// written, read back correctly for the life of the page, gone on the next load, with
+    /// no error anywhere. Nothing observable distinguishes the two natively, so the guard
+    /// is the count -- a new writer that publishes without going through `barrier` fails
+    /// here rather than on a phone.
+    #[test]
+    fn every_published_write_and_removal_reaches_the_barrier() {
+        let dir = tempfile::tempdir().unwrap();
+        let doc = dir.path().join("doc.json");
+
+        let before = barrier_count();
+        write_doc(dir.path(), &doc, b"{}").unwrap();
+        assert_eq!(barrier_count(), before + 1, "write_doc did not commit");
+
+        let stage = Stage::create(dir.path().join(".stage-barrier")).unwrap();
+        stage.write("k.json", b"ciphertext").unwrap();
+        let before = barrier_count();
+        stage.promote("k.json", &dir.path().join("k.json")).unwrap();
+        assert_eq!(barrier_count(), before + 1, "promote did not commit");
+
+        let before = barrier_count();
+        assert!(remove_published(&doc).unwrap());
+        assert_eq!(barrier_count(), before + 1, "a removal did not commit");
+
+        // Removing what is not there is not a write, so it is not a barrier either.
+        let before = barrier_count();
+        assert!(!remove_published(&doc).unwrap());
+        assert_eq!(barrier_count(), before, "an absent path committed anyway");
     }
 
     #[test]

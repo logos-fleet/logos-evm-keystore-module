@@ -45,13 +45,20 @@ sha2 = "0.10"
 # adds zero nodes, and its NamedTempFile creates at 0600 rather than at the umask.
 tempfile = "3"
 
-# The Logos runtime SDK is staged by the builder as a sibling crate. It is
-# optional + enabled by the default `logos_module` feature so `cargo test
-# --no-default-features` can build the crypto core without it (and without the
-# generated scaffold / unresolved lp_* link symbols).
-logos-rust-sdk = { path = "../logos-rust-sdk-src", optional = true }
+# The Logos runtime SDK is staged by the builder as a sibling crate.
+#
+# NOT OPTIONAL ANY MORE. It used to be, so that `cargo test --no-default-features`
+# could build the crypto core without the generated scaffold or the unresolved lp_*
+# link symbols. The core now takes ONE thing from the SDK -- the durability barrier
+# in `logos_rust_sdk::storage`, which is what makes this module's writes survive a
+# page load in the `web` variant -- and a barrier the pure-core test configuration
+# skips is a barrier no test covers. The link concern is unaffected: `storage`
+# references no lp_* symbol, and an rlib contributes only what is reached.
+logos-rust-sdk = { path = "../logos-rust-sdk-src" }
 
 [features]
 default = ["logos_module"]
-logos_module = ["dep:logos-rust-sdk"]
+# The generated contract scaffold + module glue. Off for `cargo test
+# --no-default-features`, which is how the cores stay testable without a Logos host.
+logos_module = []
 
