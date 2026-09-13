@@ -11,6 +11,8 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use logos_rust_sdk::storage::{FileStorage, Storage};
+
 use alloy::consensus::{SignableTransaction, TxEip1559, TxEnvelope, TxLegacy};
 use alloy::eips::eip2718::Encodable2718;
 use alloy::primitives::{Address, Bytes, TxKind, B256, U256};
@@ -55,10 +57,24 @@ struct Unlocked {
     expires_at: Option<Instant>,
 }
 
-/// Manages a directory of scrypt vault files plus the set of currently-unlocked
-/// signers. One vault file per account, named `<lowercase-hex-address>.json`.
+/// Manages a store of scrypt vault documents plus the set of currently-unlocked
+/// signers. One vault per account, keyed `<lowercase-hex-address>.json`.
+///
+/// THE STORE IS THE SDK'S, NOT `std::fs`. Natively the two are the same thing —
+/// a directory the host stamped into the module context. Inside a Wasm host
+/// (the module's `web` variant, running in a webview) they are not: an
+/// emscripten image HAS a filesystem, so a plain `std::fs` write here would
+/// succeed, read back correctly for the life of the page, and be gone on the
+/// next load, with no error anywhere. `logos_rust_sdk::storage` is that
+/// difference, and `commit()` — the durability barrier — is the operation the
+/// plain filesystem does not have. Every mutating method below ends at one.
 pub struct Keystore {
-    dir: PathBuf,
+    // Held as a Result rather than opened lazily so that `new` can stay
+    // infallible (the glue constructs one in on_context_ready, where there is
+    // nothing to report an error to) while a bad persistence path is still
+    // reported at the first operation that needs the store, which is exactly
+    // where `ensure_dir` used to report it.
+    store: std::result::Result<Box<dyn Storage>, String>,
     unlocked: HashMap<Address, Unlocked>,
 }
 
@@ -132,17 +148,54 @@ fn vault_name(addr: &Address) -> String {
     format!("{:x}", addr)
 }
 
+/// The store key a vault is filed under. Flat, which is what the storage
+/// contract requires and what this module always used anyway.
+fn vault_key(addr: &Address) -> String {
+    format!("{}.json", vault_name(addr))
+}
+
 impl Keystore {
+    /// A keystore over `dir` — the per-instance persistence path the host
+    /// stamped onto this module, plus whatever subdirectory the glue chose.
     pub fn new(dir: impl Into<PathBuf>) -> Self {
-        Self { dir: dir.into(), unlocked: HashMap::new() }
+        let store = FileStorage::open(dir.into())
+            .map(|s| Box::new(s) as Box<dyn Storage>)
+            .map_err(|e| e.to_string());
+        Self { store, unlocked: HashMap::new() }
     }
 
-    fn ensure_dir(&self) -> Result<()> {
-        std::fs::create_dir_all(&self.dir).map_err(|e| KeystoreError::Io(e.to_string()))
+    /// A keystore over an arbitrary store. THE TEST SEAM: the barrier has no
+    /// observable effect on a native filesystem, so the only way to assert that
+    /// every mutation reaches it is to count the calls.
+    pub fn with_store(store: Box<dyn Storage>) -> Self {
+        Self { store: Ok(store), unlocked: HashMap::new() }
     }
 
-    fn vault_path(&self, addr: &Address) -> PathBuf {
-        self.dir.join(format!("{}.json", vault_name(addr)))
+    fn store(&self) -> Result<&dyn Storage> {
+        match &self.store {
+            Ok(s) => Ok(s.as_ref()),
+            Err(e) => Err(KeystoreError::Io(e.clone())),
+        }
+    }
+
+    /// The vault's path on a real filesystem, for the parts of `eth_keystore`
+    /// whose whole public surface is path-based (`encrypt_key` takes a
+    /// directory and performs its own write; `decrypt_key` takes a file). This
+    /// is the escape hatch `Storage::local_dir` documents, and it is why a
+    /// keystore over a store with no directory behind it refuses rather than
+    /// silently doing something else.
+    fn vault_path(&self, addr: &Address) -> Result<PathBuf> {
+        Ok(self.vault_dir()?.join(vault_key(addr)))
+    }
+
+    fn vault_dir(&self) -> Result<&Path> {
+        self.store()?.local_dir().ok_or_else(|| {
+            KeystoreError::Io(
+                "this keystore's store has no directory behind it, and scrypt vault \
+                 encryption is path-based"
+                    .to_string(),
+            )
+        })
     }
 
     /// Generate a fresh BIP-39 mnemonic of `words` (12/15/18/21/24). Does NOT
@@ -159,13 +212,17 @@ impl Keystore {
     }
 
     fn persist_signer(&self, signer: &PrivateKeySigner, password: &str) -> Result<Address> {
-        self.ensure_dir()?;
+        let dir = self.vault_dir()?.to_path_buf();
         let addr = signer.address();
         let key: B256 = signer.to_bytes();
         let mut rng = rand::thread_rng();
-        let name = format!("{}.json", vault_name(&addr));
-        eth_keystore::encrypt_key(&self.dir, &mut rng, key.as_slice(), password, Some(&name))
+        let name = vault_key(&addr);
+        eth_keystore::encrypt_key(&dir, &mut rng, key.as_slice(), password, Some(&name))
             .map_err(|e| KeystoreError::Vault(e.to_string()))?;
+        // THE BARRIER. Natively an fsync; in a Wasm host what pushes the vault
+        // into the browser's IndexedDB. Without it the account exists for the
+        // life of the page and not one instant longer.
+        self.store()?.commit().map_err(|e| KeystoreError::Io(e.to_string()))?;
         Ok(addr)
     }
 
@@ -200,18 +257,19 @@ impl Keystore {
     /// touching the on-disk vault. Requires the vault password.
     pub fn export_keystore_json(&self, address: &str, password: &str) -> Result<String> {
         let addr = parse_address(address)?;
-        let path = self.vault_path(&addr);
+        let path = self.vault_path(&addr)?;
         // Validate the password decrypts, then re-emit canonical JSON contents.
         eth_keystore::decrypt_key(&path, password).map_err(|e| KeystoreError::Vault(e.to_string()))?;
-        std::fs::read_to_string(&path).map_err(|e| KeystoreError::Io(e.to_string()))
+        let bytes = self.store()?
+            .read(&vault_key(&addr))
+            .map_err(|e| KeystoreError::Io(e.to_string()))?;
+        String::from_utf8(bytes).map_err(|e| KeystoreError::Io(e.to_string()))
     }
 
     pub fn list_accounts(&self) -> Vec<Address> {
         let mut out = Vec::new();
-        if let Ok(entries) = std::fs::read_dir(&self.dir) {
-            for e in entries.flatten() {
-                let name = e.file_name();
-                let name = name.to_string_lossy();
+        if let Ok(keys) = self.store().and_then(|s| s.list().map_err(|e| KeystoreError::Io(e.to_string()))) {
+            for name in keys {
                 if let Some(stem) = name.strip_suffix(".json") {
                     if let Ok(addr) = format!("0x{stem}").parse::<Address>() {
                         out.push(addr);
@@ -225,27 +283,34 @@ impl Keystore {
 
     pub fn has_address(&self, address: &str) -> bool {
         match parse_address(address) {
-            Ok(addr) => self.vault_path(&addr).exists(),
+            Ok(addr) => self.store().map(|s| s.exists(&vault_key(&addr))).unwrap_or(false),
             Err(_) => false,
         }
     }
 
     pub fn delete_account(&mut self, address: &str, password: &str) -> Result<bool> {
         let addr = parse_address(address)?;
-        let path = self.vault_path(&addr);
+        let path = self.vault_path(&addr)?;
         if !path.exists() {
             return Ok(false);
         }
         // Require the correct password before destroying the vault.
         eth_keystore::decrypt_key(&path, password).map_err(|e| KeystoreError::Vault(e.to_string()))?;
-        std::fs::remove_file(&path).map_err(|e| KeystoreError::Io(e.to_string()))?;
+        let store = self.store()?;
+        if !store.remove(&vault_key(&addr)).map_err(|e| KeystoreError::Io(e.to_string()))? {
+            return Ok(false);
+        }
+        // A DELETE IS A WRITE. Without the barrier a vault deleted inside a
+        // webview is back after the next page load — the same class of bug as a
+        // lost write, and worse in consequence.
+        store.commit().map_err(|e| KeystoreError::Io(e.to_string()))?;
         self.unlocked.remove(&addr);
         Ok(true)
     }
 
     pub fn unlock(&mut self, address: &str, password: &str, ttl: Option<Duration>) -> Result<()> {
         let addr = parse_address(address)?;
-        let path = self.vault_path(&addr);
+        let path = self.vault_path(&addr)?;
         if !path.exists() {
             return Err(KeystoreError::NotFound(address.to_string()));
         }
@@ -436,6 +501,9 @@ fn tempfile_with(contents: &str) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use logos_rust_sdk::storage::StorageError;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
     use alloy::consensus::transaction::SignerRecoverable;
     use alloy::eips::eip2718::Decodable2718;
     use alloy::primitives::address;
@@ -464,6 +532,72 @@ mod tests {
         assert_eq!(Keystore::create_mnemonic(12).unwrap().split_whitespace().count(), 12);
         assert_eq!(Keystore::create_mnemonic(24).unwrap().split_whitespace().count(), 24);
         assert!(Keystore::create_mnemonic(13).is_err());
+    }
+
+    /// A COUNTING STORE, so the barrier can be asserted at all.
+    ///
+    /// Nothing on a native filesystem distinguishes a write that committed from
+    /// one that did not — the barrier is an fsync and its absence costs
+    /// durability across a power cut. In a `web` variant it costs the vault:
+    /// written, read back correctly for the life of the page, gone on the next
+    /// load. So the property is asserted as a count.
+    struct CountingStore {
+        inner: FileStorage,
+        commits: Arc<AtomicUsize>,
+    }
+
+    impl CountingStore {
+        fn new(dir: &Path, commits: Arc<AtomicUsize>) -> Self {
+            Self { inner: FileStorage::open(dir).unwrap(), commits }
+        }
+    }
+
+    impl Storage for CountingStore {
+        fn read(&self, key: &str) -> std::result::Result<Vec<u8>, StorageError> { self.inner.read(key) }
+        fn write(&self, key: &str, bytes: &[u8]) -> std::result::Result<(), StorageError> { self.inner.write(key, bytes) }
+        fn remove(&self, key: &str) -> std::result::Result<bool, StorageError> { self.inner.remove(key) }
+        fn exists(&self, key: &str) -> bool { self.inner.exists(key) }
+        fn list(&self) -> std::result::Result<Vec<String>, StorageError> { self.inner.list() }
+        fn local_dir(&self) -> Option<&Path> { self.inner.local_dir() }
+        fn commit(&self) -> std::result::Result<(), StorageError> {
+            self.commits.fetch_add(1, Ordering::Relaxed);
+            self.inner.commit()
+        }
+    }
+
+    #[test]
+    fn every_mutation_commits() {
+        let dir = tempfile::tempdir().unwrap();
+        let commits = Arc::new(AtomicUsize::new(0));
+        let mut ks = Keystore::with_store(Box::new(CountingStore::new(dir.path(), commits.clone())));
+
+        let before = commits.load(Ordering::Relaxed);
+        let addr = ks.import_private_key(ACCT0_PK, "pw").unwrap();
+        assert!(commits.load(Ordering::Relaxed) > before, "a persisted vault was not committed");
+
+        // A delete is a write. Without the barrier a vault deleted in a webview
+        // is BACK after the next page load.
+        let before = commits.load(Ordering::Relaxed);
+        assert!(ks.delete_account(&addr.to_string(), "pw").unwrap());
+        assert!(commits.load(Ordering::Relaxed) > before, "a deleted vault was not committed");
+
+        // ...and a delete that found nothing wrote nothing, so it commits nothing.
+        let before = commits.load(Ordering::Relaxed);
+        assert!(!ks.delete_account(&addr.to_string(), "pw").unwrap());
+        assert_eq!(commits.load(Ordering::Relaxed), before, "an absent vault committed anyway");
+    }
+
+    /// The store is one flat namespace of vault documents, and everything it did
+    /// not write is not an account. A staging file left by a crash mid-write is
+    /// the case that actually occurs.
+    #[test]
+    fn a_stray_file_in_the_store_is_not_an_account() {
+        let dir = tempfile::tempdir().unwrap();
+        let ks = Keystore::new(dir.path());
+        let addr = ks.import_private_key(ACCT0_PK, "pw").unwrap();
+        std::fs::write(dir.path().join(".logos-stage-1-x.json"), "half").unwrap();
+        std::fs::write(dir.path().join("notes.txt"), "hello").unwrap();
+        assert_eq!(ks.list_accounts(), vec![addr]);
     }
 
     #[test]
