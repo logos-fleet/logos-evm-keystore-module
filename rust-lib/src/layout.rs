@@ -594,6 +594,18 @@ impl Drop for Guard {
 ///
 /// Refuses rather than blocking: waiting behind a hung peer while a user waits on a wallet
 /// is worse than a legible refusal, and this module fails closed everywhere else.
+///
+/// WASM HAS NEITHER PRIMITIVE, and has nothing for them to exclude. `std` answers
+/// `ErrorKind::Unsupported` on `wasm32-unknown-emscripten`, and taking that as a failure
+/// wedged every mutation in a `web` build: the vault was written and then the provenance
+/// record could not be, so `create_unrelated_account` refused with
+/// `.lock is not available: try_lock() not supported` on a keystore that had just taken the
+/// key. The peer this lock exists to exclude is another PROCESS holding the same directory,
+/// and a wasm image is one process that owns its whole store — so on that family the
+/// exclusion is vacuous rather than unavailable, and the guard is granted. Narrow on
+/// purpose: only this family, and only `Unsupported`, so a real I/O failure on any host
+/// still refuses. The nesting guard above is unaffected and still holds — it is the one
+/// exclusion a single-image module can actually need.
 pub fn lock(root: &Root) -> Result<Guard, Unreadable> {
     if HELD.with(|h| h.get()) {
         return Err(Unreadable {
@@ -625,6 +637,12 @@ pub fn lock(root: &Root) -> Result<Guard, Unreadable> {
                     what: path.display().to_string(),
                     why: "another process is changing this keystore".into(),
                 })
+            }
+            Err(std::fs::TryLockError::Error(e))
+                if cfg!(target_family = "wasm") && e.kind() == std::io::ErrorKind::Unsupported =>
+            {
+                HELD.with(|h| h.set(true));
+                return Ok(Guard(f));
             }
             Err(std::fs::TryLockError::Error(e)) => {
                 return Err(Unreadable { what: path.display().to_string(), why: e.to_string() })

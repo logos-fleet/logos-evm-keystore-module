@@ -1622,6 +1622,18 @@ Note this guards the keystore *directory*, which is separate from a runtime
 single-instance guard: two `logoscore` daemons with different `--config-dir` values
 can still point at one absolute data directory.
 
+**In a `web` variant there is no lock and none is needed.** `File::try_lock` is
+`Unsupported` on `wasm32-unknown-emscripten`, and taking that as a failure wedged every
+mutation in a webview: the vault was written and then the provenance record could not be,
+so `create_unrelated_account` refused on a keystore that had just taken the key. What this
+lock excludes is another **process** holding the same directory, and a wasm image is one
+process that owns its whole store — so on that family the exclusion is vacuous rather than
+unavailable, and the guard is granted. Narrow deliberately: only `target_family = "wasm"`
+and only `ErrorKind::Unsupported`, so a real I/O failure on any host still refuses. The
+same-thread nesting rule is untouched, and it is the one exclusion a single image can
+actually need. `nix/web-variant-test.nix` is what holds this: it drives account creation,
+signing and deletion through two images of the `web` build.
+
 ### On-disk vault files
 
 * **One file per account**, named `<lowercase-hex-address>.json` (no `0x`
