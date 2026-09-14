@@ -161,4 +161,5 @@ instantiations — a page reload, to a module's store — over the whole contrac
 `configure`, custodian-gated `create_unrelated_account` with its acknowledgement,
 `request_approval` / `acknowledge` / `approve` / `fetch_result` / `ack_result`, and a
 delete that has to stay deleted. It SKIPs, saying so, where the builder publishes no
-`web` output. See `nix/web-variant-test.nix`.
+`web` output. See `nix/web-variant-test.nix`, and `nix/web-variant-drive.js`
+for the drive itself.

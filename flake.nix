@@ -19,14 +19,15 @@
       targets = systems ++ [ "x86_64-windows" ];
       forAllTargets = f: nixpkgs.lib.genAttrs targets f;
 
-      moduleFor = system: logos-module-builder.lib.mkLogosModule {
+      # One module definition; it is `packages.<system>` on it that is per-system.
+      module = logos-module-builder.lib.mkLogosModule {
         src = ./.;
         configFile = ./metadata.json;
         flakeInputs = inputs;
       };
     in
     {
-      packages = forAllTargets (system: (moduleFor system).packages.${system});
+      packages = forAllTargets (system: module.packages.${system});
 
       # The `web` variant, driven across a page reload. See nix/web-variant-test.nix
       # for what it asserts and why two images is the only honest way to ask.
@@ -42,7 +43,7 @@
       checks = forAllSystems (system:
         let
           pkgs = nixpkgs.legacyPackages.${system};
-          modulePkgs = (moduleFor system).packages.${system};
+          modulePkgs = module.packages.${system};
         in {
           web-variant =
             if modulePkgs ? web
