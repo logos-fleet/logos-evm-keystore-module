@@ -146,8 +146,19 @@ cd rust-lib && cargo test --no-default-features
 # full module (Qt plugin) + .lgx package
 nix build .#install   # -> result/modules/keystore_module/
 nix build .#lgx
+
+# the `web` variant, driven across a page reload
+nix flake check       # or: nix build .#checks.<system>.web-variant
 ```
 
 The crypto core is feature-gated away from the Logos glue so it stays
 `cargo test`-able on its own; the builder compiles the glue via the default
 `logos_module` feature. See the wallet plan for the full architecture.
+
+`web-variant` is the one check that runs the module rather than compiling it. It
+builds the emscripten image and drives it from a host harness through two
+instantiations — a page reload, to a module's store — over the whole contract:
+`configure`, custodian-gated `create_unrelated_account` with its acknowledgement,
+`request_approval` / `acknowledge` / `approve` / `fetch_result` / `ack_result`, and a
+delete that has to stay deleted. It SKIPs, saying so, where the builder publishes no
+`web` output. See `nix/web-variant-test.nix`.
