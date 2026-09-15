@@ -146,6 +146,43 @@ const walk = (dir) => fs.readdirSync(dir, { withFileTypes: true }).flatMap(
   if (JSON.stringify(doc).includes(PW)) fail('the password is in the stored vault');
   console.log('PASS: what crossed the barrier is a scrypt vault, with no password in it');
 
+  // ── AN IMPORTED KEY, WHICH IS A DIFFERENT CLAIM ─────────────────────────
+  // Creating a key needs a random number and scrypt; importing one needs BIP-39
+  // and BIP-32 as well, and NOTHING here had ever asked whether a wasm image can
+  // do that. logos-workspace#147 was the wallet refusing a seed-phrase import as
+  // "keystore_module has no mobile build" while this image was loaded and
+  // answering, so the question "can the `web` keystore import at all?" was
+  // unfalsifiable from either side. It can, and this is where that is said.
+  //
+  // A KNOWN PHRASE WITH A KNOWN ADDRESS: derivation is where a wasm build could
+  // be subtly wrong rather than absent, and only a fixed expected address
+  // catches that. Foundry's test mnemonic and its first account.
+  const PHRASE = 'test test test test test test test test test test test junk';
+  const FOUNDRY_0 = '0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266';
+  const importParams = JSON.stringify({ phrase: PHRASE, accountIndex: 0, password: PW });
+
+  // Tier D covers it exactly as it covers minting one.
+  const importRefused = a.json(REQUESTER, 'import_mnemonic', [importParams]);
+  if (importRefused.ok !== false || importRefused.error !== 'not authorized') {
+    fail('Tier D admitted an import from a caller that is not the custodian: '
+         + JSON.stringify(importRefused));
+  }
+
+  const imported = a.json(CUSTODIAN, 'import_mnemonic', [importParams]);
+  if (!imported.ok) fail('import_mnemonic: ' + JSON.stringify(imported));
+  if ((imported.address || '').toLowerCase() !== FOUNDRY_0.toLowerCase()) {
+    fail('BIP-32 derivation in wasm answered ' + imported.address + ', not ' + FOUNDRY_0);
+  }
+  console.log('PASS: a `web` image derived a known account from a seed phrase ('
+              + imported.address + ')');
+
+  // ...AND ITS NAME. On a phone the wallet has no store of its own -- there is no
+  // `wallet_backend_module` there to keep a labels.json -- so the label the user
+  // typed beside the phrase is written HERE, with the account's own password as
+  // the proof of custody set_label requires.
+  const named = a.json(CUSTODIAN, 'set_label', [imported.address, 'main', PW]);
+  if (!named.ok) fail('set_label: ' + JSON.stringify(named));
+
   // ── IMAGE B: the page after a reload ────────────────────────────────────
   const b = await spawn(store);
   nameTheRoles(b);
@@ -156,6 +193,25 @@ const walk = (dir) => fs.readdirSync(dir, { withFileTypes: true }).flatMap(
     fail('the second image does not see the key: ' + JSON.stringify(listed));
   }
   console.log('PASS: a second image lists the key the first one created');
+
+  // The IMPORTED account crossed the same barrier, and so did its name: a label
+  // that lived only in the first image would leave the wallet showing a raw
+  // address after a reload, with nothing to say why.
+  if (!(listed.accounts || []).map((x) => x.toLowerCase()).includes(FOUNDRY_0.toLowerCase())) {
+    fail('the imported account did not survive the reload: ' + JSON.stringify(listed));
+  }
+  // Keyed by the account's VAULT NAME, which is the address lowercased and
+  // without its `0x` -- not by the address as `list_accounts` spells it. Compared
+  // on that basis rather than by string equality, which is how this line first
+  // failed against a label that was perfectly well there.
+  const bare = (x) => x.toLowerCase().replace(/^0x/, '');
+  const labels = b.json(REQUESTER, 'get_labels', []);
+  const named2 = Object.entries(labels.labels || {}).find(
+    ([addr]) => bare(addr) === bare(FOUNDRY_0));
+  if (!labels.ok || !named2 || named2[1] !== 'main') {
+    fail('the imported account lost its name across the reload: ' + JSON.stringify(labels));
+  }
+  console.log('PASS: the imported account and its name both survive a reload');
 
   // ...and it is a USABLE key, not merely a file that survived. Signing is the
   // approved-signing flow end to end: a named module asks, the approver renders
