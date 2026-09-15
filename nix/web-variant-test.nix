@@ -22,6 +22,15 @@
 #     about any of it. Every step of the drive has to hold, in order, or this
 #     module is not usable in a webview.
 #
+# IMPORTING IS ITS OWN CLAIM, and one nothing here made until
+# logos-workspace#147. Creating a key needs a random number and scrypt; taking
+# one FROM A SEED PHRASE needs BIP-39 and BIP-32 as well, and a wasm build can be
+# subtly wrong there rather than absent — so the drive imports a known phrase and
+# insists on the known address, then names the account, because on a phone the
+# wallet has no store of its own to keep a label in. #147 was that wallet
+# refusing the import as "keystore_module has no mobile build" while this image
+# was loaded and answering; the question it raised was answerable only here.
+#
 # WHAT DOES THE DRIVING is `web-variant-drive.js` beside this file: the Web
 # container's job, done in node. This derivation only builds the variant, puts
 # the two beside each other and runs them.
